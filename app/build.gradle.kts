@@ -125,6 +125,6 @@ dependencies {
   "ksp"(libs.moshi.kotlin.codegen)
 
   // Spotify Official Integration dependencies
-  implementation("com.spotify.android:auth:2.1.1")
-  implementation(files("libs/spotify-app-remote-release-0.8.0.aar"))
+  // implementation("com.spotify.android:auth:2.1.1")
+  // implementation(files("libs/spotify-app-remote-release-0.8.0.aar"))
 }
