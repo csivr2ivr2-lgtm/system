@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">עוזר חכם</string>
+    <string name="listening_status_idle">לחץ על המיקרופון כדי לדבר 🎙️</string>
+    <string name="listening_status_listening">מקשיב לך עכשיו...</string>
+    <string name="listening_status_processing">מעבד פקודה...</string>
+    <string name="listening_status_error">אירעה שגיאה. נסה שוב</string>
+    <string name="permission_audio_title">אישור הקלטת קול</string>
+    <string name="permission_audio_desc">עוזר חכם זקוק לגישה למיקרופון כדי לשמוע ולפתוח את פקודותיך הקוליות.</string>
+    <string name="permission_contacts_title">גישה לאנשי קשר</string>
+    <string name="permission_contacts_desc">נחוצה גישה לאנשי קשר כדי שתוכל לומר \'תתקשר לאורי\' ונמצא את מספר הטלפון המתאים.</string>
+    <string name="button_grant">מענק אישור</string>
+    <string name="quick_commands_title">פקודות מהירות לדוגמה</string>
+</resources>

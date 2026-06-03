@@ -1,0 +1,6 @@
+{
+  "name": "עוזר חכם",
+  "description": "עוזר קולי חכם לביצוע פקודות קוליות בעברית: חיוג, וואטסאפ, נגינת מוזיקה בספוטיפיי ובדיקת שעה קולית.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
