@@ -66,90 +66,198 @@ object SpotifyModule {
      */
     private fun executeMusicBrainzPipeline(processedQuery: String, originalQuery: String, context: Context) {
         try {
-            // Step 1: Text Cleansing
-            val cleaned = cleanText(processedQuery)
-            Log.d(TAG, "Step 1 - Cleaned query: \"$cleaned\" (original processed was: \"$processedQuery\")")
+            var resolvedSpotifyArtistId: String? = null
 
-            // Step 2: MusicBrainz Recording Search
-            val encodedQuery = URLEncoder.encode(cleaned, "UTF-8")
-            val searchUrl = "https://musicbrainz.org/ws/2/recording?query=$encodedQuery&fmt=json&limit=1"
+            // Strategy 1: Search recording using fully cleaned query (keeping text from parenthesized parts)
+            val cleanedFull = cleanText(processedQuery)
+            Log.d(TAG, "Strategy 1 - Cleaned query (full): \"$cleanedFull\" (original processed was: \"$processedQuery\")")
+            resolvedSpotifyArtistId = searchRecordingAndGetArtistSpotifyId(cleanedFull)
+
+            // Strategy 2: Search recording using cleaned query WITHOUT parenthesized contents
+            if (resolvedSpotifyArtistId == null) {
+                val cleanedWithoutParens = cleanTextWithoutParentheses(processedQuery)
+                if (cleanedWithoutParens != cleanedFull && cleanedWithoutParens.isNotEmpty()) {
+                    Log.d(TAG, "Strategy 2 - Cleaned query without parentheses: \"$cleanedWithoutParens\"")
+                    resolvedSpotifyArtistId = searchRecordingAndGetArtistSpotifyId(cleanedWithoutParens)
+                }
+            }
+
+            // Strategy 3: Search for primary artist directly by splitting input on delimiters (e.g. '-')
+            if (resolvedSpotifyArtistId == null) {
+                val segments = processedQuery.split(Regex("[-|/_]"))
+                if (segments.isNotEmpty()) {
+                    val primaryArtist = segments[0].trim()
+                    val cleanedPrimaryArtist = cleanText(primaryArtist)
+                    if (cleanedPrimaryArtist.isNotEmpty() && cleanedPrimaryArtist.lowercase() != cleanedFull.lowercase()) {
+                        Log.d(TAG, "Strategy 3 - Searching artist directly: \"$cleanedPrimaryArtist\"")
+                        resolvedSpotifyArtistId = searchArtistAndGetSpotifyId(cleanedPrimaryArtist)
+                    }
+                }
+            }
+
+            // Strategy 4: Search for secondary artist (e.g. guest artist inside parenthesized expression)
+            if (resolvedSpotifyArtistId == null) {
+                val secondaryArtist = extractSecondaryArtist(processedQuery)
+                if (secondaryArtist != null && secondaryArtist.isNotEmpty()) {
+                    val cleanedSecondary = cleanText(secondaryArtist)
+                    if (cleanedSecondary.isNotEmpty()) {
+                        Log.d(TAG, "Strategy 4 - Searching guest artist directly: \"$cleanedSecondary\"")
+                        resolvedSpotifyArtistId = searchArtistAndGetSpotifyId(cleanedSecondary)
+                    }
+                }
+            }
+
+            // Strategy 5: Generic query lookup for any matching artist directly using the entire cleaned text
+            if (resolvedSpotifyArtistId == null) {
+                if (cleanedFull.isNotEmpty()) {
+                    Log.d(TAG, "Strategy 5 - Searching entire cleaned query as artist directly: \"$cleanedFull\"")
+                    resolvedSpotifyArtistId = searchArtistAndGetSpotifyId(cleanedFull)
+                }
+            }
+
+            // Strategy 6: Search using original unresolved query as artist directly
+            if (resolvedSpotifyArtistId == null && originalQuery != processedQuery) {
+                val cleanedOrig = cleanText(originalQuery)
+                if (cleanedOrig.isNotEmpty()) {
+                    Log.d(TAG, "Strategy 6 - Searching original query as artist directly: \"$cleanedOrig\"")
+                    resolvedSpotifyArtistId = searchArtistAndGetSpotifyId(cleanedOrig)
+                }
+            }
+
+            if (resolvedSpotifyArtistId != null) {
+                val androidUri = "spotify:artist:$resolvedSpotifyArtistId"
+                val spotifyUrl = "https://open.spotify.com/artist/$resolvedSpotifyArtistId"
+                Log.d(TAG, "Successfully resolved target Spotify Artist ID: $resolvedSpotifyArtistId")
+                openSpotifyArtistUri(androidUri, spotifyUrl, context)
+            } else {
+                Log.w(TAG, "All MusicBrainz strategies failed to find a Spotify Artist ID. Launching fallback generic search.")
+                launchForegroundActivityIntent(processedQuery, context)
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception during MusicBrainz sequence calculation, falling back to search", e)
+            launchForegroundActivityIntent(processedQuery, context)
+        }
+    }
+
+    /**
+     * Executes MusicBrainz recording search and queries the primary artist relationships to extract the Spotify ID.
+     */
+    private fun searchRecordingAndGetArtistSpotifyId(query: String): String? {
+        try {
+            val encodedQuery = URLEncoder.encode(query, "UTF-8")
+            val searchUrl = "https://musicbrainz.org/ws/2/recording?query=$encodedQuery&fmt=json&limit=3"
 
             val searchRequest = Request.Builder()
                 .url(searchUrl)
-                .header("User-Agent", "VoiceAssistantApp/1.0 (yemot770100@gmail.com)")
+                .header("User-Agent", "MyApp/1.0 (cs.ivr2ivr2@gmail.com)")
                 .header("Accept", "application/json")
                 .get()
                 .build()
 
             httpClient.newCall(searchRequest).execute().use { response ->
                 if (!response.isSuccessful) {
-                    Log.e(TAG, "Step 2 - MusicBrainz search failed: ${response.code}. Falling back to search.")
-                    launchForegroundActivityIntent(processedQuery, context)
-                    return
+                    Log.e(TAG, "Recording search failed with response code: ${response.code}")
+                    return null
                 }
 
                 val bodyStr = response.body?.string() ?: ""
                 val json = JSONObject(bodyStr)
                 val recordings = json.optJSONArray("recordings")
-                if (recordings == null || recordings.length() == 0) {
-                    Log.w(TAG, "Step 2 - No recordings found on MusicBrainz for \"$cleaned\". Falling back to search.")
-                    launchForegroundActivityIntent(processedQuery, context)
-                    return
-                }
-
-                // Step 3: Extract MusicBrainz Artist ID
-                val recording = recordings.getJSONObject(0)
-                val artistCredit = recording.optJSONArray("artist-credit")
-                if (artistCredit == null || artistCredit.length() == 0) {
-                    Log.w(TAG, "Step 3 - No artist-credit found in MusicBrainz response. Falling back.")
-                    launchForegroundActivityIntent(processedQuery, context)
-                    return
-                }
-
-                val credit = artistCredit.getJSONObject(0)
-                val artistObj = credit.optJSONObject("artist")
-                if (artistObj == null) {
-                    Log.w(TAG, "Step 3 - No artist object found inside credit. Falling back.")
-                    launchForegroundActivityIntent(processedQuery, context)
-                    return
-                }
-
-                val mbid = artistObj.optString("id") ?: ""
-                if (mbid.isEmpty()) {
-                    Log.w(TAG, "Step 3 - MBID extracted is empty. Falling back.")
-                    launchForegroundActivityIntent(processedQuery, context)
-                    return
-                }
-
-                Log.d(TAG, "Step 3 - Successfully extracted MusicBrainz Artist ID (MBID): $mbid")
-
-                // Step 4: Retrieve Artist External Connections
-                val artistUrlStr = "https://musicbrainz.org/ws/2/artist/$mbid?inc=url-rels&fmt=json"
-                val artistRequest = Request.Builder()
-                    .url(artistUrlStr)
-                    .header("User-Agent", "VoiceAssistantApp/1.0 (yemot770100@gmail.com)")
-                    .header("Accept", "application/json")
-                    .get()
-                    .build()
-
-                httpClient.newCall(artistRequest).execute().use { artistResponse ->
-                    if (!artistResponse.isSuccessful) {
-                        Log.e(TAG, "Step 4 - Artist details request failed: ${artistResponse.code}. Falling back.")
-                        launchForegroundActivityIntent(processedQuery, context)
-                        return
+                if (recordings != null && recordings.length() > 0) {
+                    val limit = minOf(recordings.length(), 3)
+                    for (i in 0 until limit) {
+                        val recording = recordings.getJSONObject(i)
+                        val artistCredit = recording.optJSONArray("artist-credit")
+                        if (artistCredit != null && artistCredit.length() > 0) {
+                            val credit = artistCredit.getJSONObject(0)
+                            val artistObj = credit.optJSONObject("artist")
+                            if (artistObj != null) {
+                                val mbid = artistObj.optString("id") ?: ""
+                                if (mbid.isNotEmpty()) {
+                                    val spotifyId = getSpotifyIdFromMbid(mbid)
+                                    if (spotifyId != null) {
+                                        return spotifyId
+                                    }
+                                }
+                            }
+                        }
                     }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in searchRecordingAndGetArtistSpotifyId for query: $query", e)
+        }
+        return null
+    }
 
-                    val artistBodyStr = artistResponse.body?.string() ?: ""
-                    val artistJson = JSONObject(artistBodyStr)
-                    val relations = artistJson.optJSONArray("relations")
-                    if (relations == null || relations.length() == 0) {
-                        Log.w(TAG, "Step 4 - No relation data found for artist $mbid. Falling back.")
-                        launchForegroundActivityIntent(processedQuery, context)
-                        return
+    /**
+     * Executes MusicBrainz artist search and queries the matching artist's relationships to extract the Spotify ID.
+     */
+    private fun searchArtistAndGetSpotifyId(artistName: String): String? {
+        try {
+            val encodedQuery = URLEncoder.encode(artistName, "UTF-8")
+            val searchUrl = "https://musicbrainz.org/ws/2/artist?query=$encodedQuery&fmt=json&limit=3"
+
+            val searchRequest = Request.Builder()
+                .url(searchUrl)
+                .header("User-Agent", "MyApp/1.0 (cs.ivr2ivr2@gmail.com)")
+                .header("Accept", "application/json")
+                .get()
+                .build()
+
+            httpClient.newCall(searchRequest).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Log.e(TAG, "Artist search failed with response code: ${response.code}")
+                    return null
+                }
+
+                val bodyStr = response.body?.string() ?: ""
+                val json = JSONObject(bodyStr)
+                val artists = json.optJSONArray("artists")
+                if (artists != null && artists.length() > 0) {
+                    val limit = minOf(artists.length(), 3)
+                    for (i in 0 until limit) {
+                        val artistObj = artists.getJSONObject(i)
+                        val mbid = artistObj.optString("id") ?: ""
+                        if (mbid.isNotEmpty()) {
+                            val spotifyId = getSpotifyIdFromMbid(mbid)
+                            if (spotifyId != null) {
+                                return spotifyId
+                            }
+                        }
                     }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in searchArtistAndGetSpotifyId for artistName: $artistName", e)
+        }
+        return null
+    }
 
-                    // Step 5: Find Spotify URL
-                    var spotifyUrl: String? = null
+    /**
+     * Retrieves internal MusicBrainz relationships for specified MBID and extracts Spotify ID.
+     */
+    private fun getSpotifyIdFromMbid(mbid: String): String? {
+        try {
+            val artistUrlStr = "https://musicbrainz.org/ws/2/artist/$mbid?inc=url-rels&fmt=json"
+            val artistRequest = Request.Builder()
+                .url(artistUrlStr)
+                .header("User-Agent", "MyApp/1.0 (cs.ivr2ivr2@gmail.com)")
+                .header("Accept", "application/json")
+                .get()
+                .build()
+
+            httpClient.newCall(artistRequest).execute().use { artistResponse ->
+                if (!artistResponse.isSuccessful) {
+                    Log.e(TAG, "Artist relations lookup failed with response code: ${artistResponse.code}")
+                    return null
+                }
+
+                val artistBodyStr = artistResponse.body?.string() ?: ""
+                val artistJson = JSONObject(artistBodyStr)
+                val relations = artistJson.optJSONArray("relations")
+                if (relations != null) {
                     for (i in 0 until relations.length()) {
                         val rel = relations.getJSONObject(i)
                         val type = rel.optString("type")
@@ -158,47 +266,24 @@ object SpotifyModule {
                             if (urlRelObj != null) {
                                 val resourceUrl = urlRelObj.optString("resource")
                                 if (resourceUrl.isNotEmpty()) {
-                                    spotifyUrl = resourceUrl
-                                    break
+                                    var cleanUrl = resourceUrl.split("?")[0]
+                                    if (cleanUrl.endsWith("/")) {
+                                        cleanUrl = cleanUrl.substring(0, cleanUrl.length - 1)
+                                    }
+                                    val spotifyArtistId = cleanUrl.substringAfterLast("/")
+                                    if (spotifyArtistId.isNotEmpty() && spotifyArtistId != "spotify" && !spotifyArtistId.contains("open.spotify")) {
+                                        return spotifyArtistId
+                                    }
                                 }
                             }
                         }
                     }
-
-                    if (spotifyUrl.isNullOrEmpty()) {
-                        Log.w(TAG, "Step 5 - No Spotify URL listed in artist relations. Falling back.")
-                        launchForegroundActivityIntent(processedQuery, context)
-                        return
-                    }
-
-                    Log.d(TAG, "Step 5 - Found Spotify URL resource link: $spotifyUrl")
-
-                    // Step 6: Extract Spotify Artist ID
-                    var cleanUrl = spotifyUrl.split("?")[0]
-                    if (cleanUrl.endsWith("/")) {
-                        cleanUrl = cleanUrl.substring(0, cleanUrl.length - 1)
-                    }
-                    val spotifyArtistId = cleanUrl.substringAfterLast("/")
-                    if (spotifyArtistId.isEmpty() || spotifyArtistId == "spotify" || spotifyArtistId.contains("open.spotify")) {
-                        Log.w(TAG, "Step 6 - Extracted Artist ID \"$spotifyArtistId\" appears invalid. Falling back.")
-                        launchForegroundActivityIntent(processedQuery, context)
-                        return
-                    }
-
-                    Log.d(TAG, "Step 6 - Extracted Spotify Artist ID: $spotifyArtistId")
-
-                    // Step 7: Build Android Deep Link URI
-                    val androidUri = "spotify:artist:$spotifyArtistId"
-                    Log.d(TAG, "Step 7 - Final target Android URI built: $androidUri")
-
-                    // Step 8: Open in Android directly to artist page
-                    openSpotifyArtistUri(androidUri, spotifyUrl, context)
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Exception during MusicBrainz sequence calculation, falling back to search", e)
-            launchForegroundActivityIntent(processedQuery, context)
+            Log.e(TAG, "Error retrieving Spotify ID from MBID: $mbid", e)
         }
+        return null
     }
 
     /**
@@ -228,6 +313,44 @@ object SpotifyModule {
 
         // Merge repeating white spaces to a single blank space and trim bounds
         return text.replace(Regex("\\s+"), " ").trim()
+    }
+
+    /**
+     * Cleans up raw query string by fully removing parentheses and parenthesized content.
+     */
+    fun cleanTextWithoutParentheses(input: String): String {
+        val withoutParens = input.replace(Regex("\\([^)]*\\)"), " ")
+                                 .replace(Regex("\\[[^]]*\\]"), " ")
+        return cleanText(withoutParens)
+    }
+
+    /**
+     * Attempts to find a secondary / guest artist name from guest symbols or parenthesized texts.
+     */
+    private fun extractSecondaryArtist(input: String): String? {
+        val regex = Regex("\\(([^)]*)\\)")
+        val match = regex.find(input)
+        if (match != null) {
+            val content = match.groupValues[1]
+            val cleanedContent = content.replace(Regex("(?i)(?:feat\\.?|ft\\.?|featuring|עם)"), " ").trim()
+            if (cleanedContent.isNotEmpty()) {
+                return cleanedContent
+            }
+        }
+
+        val splitWords = listOf(" feat. ", " feat ", " ft. ", " ft ", " featuring ", " עם ")
+        for (delimiter in splitWords) {
+            if (input.lowercase().contains(delimiter)) {
+                val parts = input.split(Regex("(?i)$delimiter"))
+                if (parts.size > 1) {
+                    val candidate = parts[1].trim()
+                    if (candidate.isNotEmpty()) {
+                        return candidate
+                    }
+                }
+            }
+        }
+        return null
     }
 
     /**
