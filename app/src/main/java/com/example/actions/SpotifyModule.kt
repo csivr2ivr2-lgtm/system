@@ -17,7 +17,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import okhttp3.FormBody
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -31,12 +30,11 @@ object SpotifyModule {
         .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
-    // Structured concurrency background scope
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     /**
      * Entry point for music voice command processing.
-     * Starts an asynchronous background coroutine to resolve and play the target track using Spotify's on-device media player integration.
+     * Starts an asynchronous background coroutine to resolve and play the target track using Spotify.
      */
     fun play(song: String, context: Context): String {
         val trimmedSong = song.trim()
@@ -55,23 +53,9 @@ object SpotifyModule {
 
                 val finalQuery = if (correctedSong.isNotEmpty()) correctedSong else if (correctedSongAI.isNotEmpty()) correctedSongAI else trimmedSong
 
-                // Step 3: Try background URI resolution and remote command play first
-                Log.d(TAG, "Attempting background URI resolution for: $finalQuery")
-                val resolvedUri = resolveSpotifyUri(finalQuery)
-
-                if (resolvedUri != null) {
-                    Log.d(TAG, "Background URI resolved: $resolvedUri. Launching via Spotify App Remote command...")
-                    SpotifyRemoteControl.connectAndExecute(context, { remote ->
-                        remote.playerApi.play(resolvedUri)
-                        Log.d(TAG, "Dispatched play command for $resolvedUri on Spotify App Remote")
-                    }, { error ->
-                        Log.e(TAG, "Background App Remote playback connection failed, trying fallback to search intent", error)
-                        launchStandardSearchIntent(finalQuery, context)
-                    })
-                } else {
-                    Log.w(TAG, "Failed resolving background URI. Falling back to platform media search intent.")
-                    launchStandardSearchIntent(finalQuery, context)
-                }
+                // Step 3: Trigger background play-from-search without client credentials
+                Log.d(TAG, "Triggering playFromSearch via MediaBrowserService for: $finalQuery")
+                launchStandardSearchIntent(finalQuery, context)
 
             } catch (e: Exception) {
                 Log.e(TAG, "Failed executing Spotify playback flow, falling back to original query", e)
@@ -83,7 +67,7 @@ object SpotifyModule {
     }
 
     /**
-     * Corrects music title queries with Gemini 3.5 Flash API
+     * Corrects music title queries with Gemini 3.5 Flash API if key is set
      */
     private fun correctSongWithAI(query: String): String {
         val apiKey = try { BuildConfig.GEMINI_API_KEY } catch (e: Exception) { "" }
@@ -285,112 +269,5 @@ object SpotifyModule {
                 launchForegroundActivityIntent(query, context, artist, title)
             }
         }
-    }
-
-    private fun resolveSpotifyUri(query: String): String? {
-        val clientId = try { BuildConfig.SPOTIFY_CLIENT_ID } catch (e: Exception) { "" }
-            .ifEmpty { "8ae488cd9fe44caa9f0ad9fa1586b251" }
-            .let { if (it == "MY_SPOTIFY_CLIENT_ID") "8ae488cd9fe44caa9f0ad9fa1586b251" else it }
-        val clientSecret = try { BuildConfig.SPOTIFY_CLIENT_SECRET } catch (e: Exception) { "" }
-            .ifEmpty { "6ee5638feb744f88a34681a29094a238" }
-            .let { if (it == "MY_SPOTIFY_CLIENT_SECRET") "6ee5638feb744f88a34681a29094a238" else it }
-
-        if (clientId == "MY_SPOTIFY_CLIENT_ID" || clientSecret == "MY_SPOTIFY_CLIENT_SECRET" || clientId.isEmpty() || clientSecret.isEmpty()) {
-            Log.w(TAG, "Spotify credentials not fully configured in environment properties. Background search bypassed.")
-            return null
-        }
-
-        try {
-            val tokenUrl = "https://accounts.spotify.com/api/token"
-            val tokenBody = FormBody.Builder()
-                .add("grant_type", "client_credentials")
-                .add("client_id", clientId)
-                .add("client_secret", clientSecret)
-                .build()
-
-            val tokenRequest = Request.Builder()
-                .url(tokenUrl)
-                .post(tokenBody)
-                .build()
-
-            httpClient.newCall(tokenRequest).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.e(TAG, "Failed auth with Spotify accounts server: ${response.code}")
-                    return null
-                }
-                val bodyStr = response.body?.string() ?: return null
-                val json = JSONObject(bodyStr)
-                val token = json.optString("access_token") ?: return null
-
-                val encodedQuery = java.net.URLEncoder.encode(query, "UTF-8")
-                val searchUrl = "https://api.spotify.com/v1/search?q=$encodedQuery&type=track,playlist,album,artist&limit=1"
-
-                val searchRequest = Request.Builder()
-                    .url(searchUrl)
-                    .get()
-                    .header("Authorization", "Bearer $token")
-                    .build()
-
-                httpClient.newCall(searchRequest).execute().use { searchResponse ->
-                    if (!searchResponse.isSuccessful) {
-                        Log.e(TAG, "Failed background Spotify search api: ${searchResponse.code}")
-                        return null
-                    }
-                    val searchStr = searchResponse.body?.string() ?: return null
-                    val searchJson = JSONObject(searchStr)
-
-                    // 1. Try Tracks
-                    val tracksObj = searchJson.optJSONObject("tracks")
-                    val trackItems = tracksObj?.optJSONArray("items")
-                    if (trackItems != null && trackItems.length() > 0) {
-                        val track = trackItems.getJSONObject(0)
-                        val uri = track.optString("uri")
-                        if (!uri.isNullOrEmpty()) {
-                            Log.d(TAG, "Resolved canonical Track URI via background Web Search: $uri")
-                            return uri
-                        }
-                    }
-
-                    // 2. Try Playlists
-                    val playlistsObj = searchJson.optJSONObject("playlists")
-                    val playlistItems = playlistsObj?.optJSONArray("items")
-                    if (playlistItems != null && playlistItems.length() > 0) {
-                        val playlist = playlistItems.getJSONObject(0)
-                        val uri = playlist.optString("uri")
-                        if (!uri.isNullOrEmpty()) {
-                            Log.d(TAG, "Resolved canonical Playlist URI via background Web Search: $uri")
-                            return uri
-                        }
-                    }
-
-                    // 3. Try Albums
-                    val albumsObj = searchJson.optJSONObject("albums")
-                    val albumItems = albumsObj?.optJSONArray("items")
-                    if (albumItems != null && albumItems.length() > 0) {
-                        val album = albumItems.getJSONObject(0)
-                        val uri = album.optString("uri")
-                        if (!uri.isNullOrEmpty()) {
-                            Log.d(TAG, "Resolved canonical Album URI via background Web Search: $uri")
-                            return uri
-                        }
-                    }
-
-                    // 4. Try Artists
-                    val artistsObj = searchJson.optJSONObject("artists")
-                    val artistItems = artistsObj?.optJSONArray("items")
-                    if (artistItems != null && artistItems.length() > 0) {
-                        val artist = artistItems.getJSONObject(0)
-                        val uri = artist.optString("uri")
-                        if (!uri.isNullOrEmpty()) {
-                            Log.d(TAG, "Resolved canonical Artist URI via background Web Search: $uri")
-                            return uri
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Background Web API URI search encountered exception", e)
-        }
-        return null
     }
 }
